@@ -1999,8 +1999,8 @@ private fun isPlusPanelClass(cls: Class<*>): Boolean = hasClassFlag(cls, CF_PLUS
 
 /** dispatchDraw 细线扫描缓存：记录已检查/已改色的非纯色 drawable 及代次，
  *  避免每帧对同一个皮肤位图/九宫格反复 renderSample（每次分配 Bitmap + Canvas ~480µs）。 */
-private val thinLineCheckedGen: MutableMap<Drawable, Long> = ColorMath.instanceCache()
-private val thinLineAppliedFilter: MutableMap<Drawable, android.graphics.ColorFilter> =
+private val thinLineCheckedGen: MutableMap<Any, Long> = ColorMath.instanceCache()
+private val thinLineAppliedFilter: MutableMap<Any, android.graphics.ColorFilter> =
     ColorMath.instanceCache()
 
 /**
@@ -7096,8 +7096,8 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** fixTinySolidBg 实例级代次缓存：同一背景 drawable 在同一调色板代次内已确认/已改色
      *  且 filter 未被清掉时直接跳过，避免滚动复用时反复 16 点 getPixel + renderSample。 */
-    private val tinySolidBgCheckedGen: MutableMap<Drawable, Long> = ColorMath.instanceCache()
-    private val tinySolidBgFilter: MutableMap<Drawable, android.graphics.ColorFilter> =
+    private val tinySolidBgCheckedGen: MutableMap<Any, Long> = ColorMath.instanceCache()
+    private val tinySolidBgFilter: MutableMap<Any, android.graphics.ColorFilter> =
         ColorMath.instanceCache()
 
     private fun fixTinySolidBg(v: View, d: Drawable) {
