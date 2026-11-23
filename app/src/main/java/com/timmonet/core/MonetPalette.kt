@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamiccolor.ColorSpec
@@ -144,6 +145,7 @@ object MonetPalette {
      */
     fun onSettingsChanged() {
         // 用户主动改了设置，应当**立刻**重建，不要被失败重试节流挡住。
+        invalidateSystemDarkCache()
         resetAttemptThrottle()
         rebuildHandler.post {
             val next = SettingsBridge.readCurrent()
@@ -247,9 +249,27 @@ object MonetPalette {
         return systemDark()
     }
 
+    @Volatile
+    private var cachedSystemDark = false
+
+    @Volatile
+    private var lastSystemDarkCheckMs = 0L
+
+    private const val SYSTEM_DARK_CACHE_TTL_MS = 1000L
+
+    /** 配置变更或设置更新时主动失效系统深浅缓存，避免等待 TTL。 */
+    fun invalidateSystemDarkCache() {
+        lastSystemDarkCheckMs = 0L
+    }
+
     private fun systemDark(): Boolean {
         val ctx = appContext ?: return false
-        return try {
+        val now = SystemClock.uptimeMillis()
+        val last = lastSystemDarkCheckMs
+        if (last != 0L && now - last < SYSTEM_DARK_CACHE_TTL_MS) {
+            return cachedSystemDark
+        }
+        val dark = try {
             // TIM 用自有主题引擎，应用级 UiModeManager 常被强制为浅色
             // （night=NO），即使系统开了深色模式。自动模式应以系统全局
             // 配置为准，所以优先读 Resources.getSystem() 的 uiMode。
@@ -257,13 +277,17 @@ object MonetPalette {
             if ((systemUiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
             ) {
-                return true
+                true
+            } else {
+                val ui = ctx.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+                (ui?.nightMode ?: Configuration.UI_MODE_NIGHT_UNDEFINED) == Configuration.UI_MODE_NIGHT_YES
             }
-            val ui = ctx.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
-            (ui?.nightMode ?: Configuration.UI_MODE_NIGHT_UNDEFINED) == Configuration.UI_MODE_NIGHT_YES
         } catch (t: Throwable) {
             false
         }
+        cachedSystemDark = dark
+        lastSystemDarkCheckMs = now
+        return dark
     }
 
     private fun rebuild() {

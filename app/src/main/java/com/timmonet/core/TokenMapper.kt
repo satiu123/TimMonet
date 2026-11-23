@@ -14,6 +14,8 @@ object TokenMapper {
 
     private val memo = ConcurrentHashMap<Long, Int>()
     private val inlineMemo = ConcurrentHashMap<Long, Int>()
+    // 64-bit 编码（高 32 位非 0 表示命中，0L 表示无映射），避免 32-bit 颜色域哨兵冲突（坑 5）
+    private val drawableBgMemo = ConcurrentHashMap<Int, Long>()
     private val tintMemo = ConcurrentHashMap<String, Int>()
     private val roleMemo = ConcurrentHashMap<String, Role>()
 
@@ -192,7 +194,17 @@ object TokenMapper {
     fun bgColorForDrawable(color: Int): Int? {
         // 全透明：不参与任何映射（约定见 AGENTS.md）
         if (ColorMath.isTransparent(color)) return null
-        val alpha = ColorMath.alpha(color)
+        refreshMemoGeneration()
+        drawableBgMemo[color]?.let { packed ->
+            return if (packed == 0L) null else packed.toInt()
+        }
+        val result = computeBgColorForDrawable(color)
+        if (drawableBgMemo.size > 16384) drawableBgMemo.clear()
+        drawableBgMemo[color] = if (result == null) 0L else ((result.toLong() and 0xFFFFFFFFL) or (1L shl 32))
+        return result
+    }
+
+    private fun computeBgColorForDrawable(color: Int): Int? {
         // 品牌蓝**底**映射到"对方气泡背景"色，而不是 primary：
         // 钱包页顶栏(?attr/a_5 → @color/2p #0099FF)整条都是这个底，
         // 用 primary 会亮得刺眼；换成 guest bubble 后和聊天里收到的那侧气泡同色，
@@ -741,6 +753,7 @@ object TokenMapper {
             if (memoGeneration == generation) return
             memo.clear()
             inlineMemo.clear()
+            drawableBgMemo.clear()
             tintMemo.clear()
             // ⚠️ roleMemo 也必须一起失效：computeRole 依赖 MonetPalette.isAmoled()
             // （AMOLED 开时 bubble_host → GUEST_BUBBLE 等），而 isAmoled 会随设置
