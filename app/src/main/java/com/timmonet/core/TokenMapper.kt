@@ -246,32 +246,48 @@ object TokenMapper {
     // 因此这些函数**不收 dark 形参** —— 历史上收过，但它从不参与判据，只会让
     // 调用方以为"传 false 就是浅色档"（真踩过，见坑 6）。
 
+    // 常用角色色按代次缓存，避免热路径（dispatchDraw / bind）反复进入 resolve() + palette() + amoledBlack()。
+    @Volatile private var cachedBgList = 0
+    @Volatile private var cachedBgPage = 0
+    @Volatile private var cachedOutlineVariant = 0
+    @Volatile private var cachedInputBg = 0
+    @Volatile private var cachedBgCard = 0
+    @Volatile private var cachedGuestBubble = 0
+    @Volatile private var cachedRolesGen = -1L
+
+    private fun ensureRoleCache() {
+        val gen = MonetPalette.generation()
+        if (cachedRolesGen == gen) return
+        val scheme = MonetPalette.palette()
+        cachedBgList = resolve(Role.BG_LIST, 0xFF000000.toInt(), scheme)
+        cachedBgPage = resolve(Role.BG_PAGE, 0xFF000000.toInt(), scheme)
+        cachedOutlineVariant = resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), scheme)
+        cachedInputBg = resolve(Role.INPUT_BG, 0xFF000000.toInt(), scheme)
+        cachedBgCard = resolve(Role.BG_CARD, 0xFF000000.toInt(), scheme)
+        cachedGuestBubble = resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), scheme)
+        cachedRolesGen = gen
+    }
+
     /** 聊天列表条目背景的两种角色色。 */
-    fun bgList(): Int =
-        resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette())
+    fun bgList(): Int { ensureRoleCache(); return cachedBgList }
 
     /** 页面底色（BG_PAGE）：给"未选中底"这类需要跟页面融为一体的地方用。 */
-    fun bgPage(): Int =
-        resolve(Role.BG_PAGE, 0xFF000000.toInt(), MonetPalette.palette())
+    fun bgPage(): Int { ensureRoleCache(); return cachedBgPage }
 
     /** 深色下可见的"线"色（分隔线/边框）：给分隔线类资源用。 */
-    fun outlineVariant(): Int =
-        resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette())
+    fun outlineVariant(): Int { ensureRoleCache(); return cachedOutlineVariant }
 
     /** 输入框/搜索框底色（`Role.INPUT_BG`）：深色下 surfaceContainerHigh。
      *
      *  与 [bgPage] 的区别很重要：TIM 浅色下"页面底"和"输入框底"都是浅灰，
      *  "亮底压暗"这类兜底如果一律给页面底色，输入框就会和弹窗/卡片割裂
      *  （转发弹窗实测：普通文字转发时输入框变成页面色）。 */
-    fun inputBg(): Int =
-        resolve(Role.INPUT_BG, 0xFF000000.toInt(), MonetPalette.palette())
+    fun inputBg(): Int { ensureRoleCache(); return cachedInputBg }
 
-    fun bgCard(): Int =
-        resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette())
+    fun bgCard(): Int { ensureRoleCache(); return cachedBgCard }
 
     /** 对方消息气泡的背景色（免打扰灰泡沿用）。 */
-    fun guestBubble(): Int =
-        resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), MonetPalette.palette())
+    fun guestBubble(): Int { ensureRoleCache(); return cachedGuestBubble }
 
     private fun inferByColor(color: Int, scheme: DynamicScheme): Int {
         // 全透明：原样返回（约定见 AGENTS.md）

@@ -394,12 +394,16 @@ object TimMonetHooks {
         hookAioNavBadge(module, classLoader)
         hookArkToken(module, classLoader)
         hookArkPackagePatch(module, classLoader)
-        // 启动时把已安装的 Ark 包主动补一遍（延迟 3s：install() 跑在
-        // Application 创建之前，`ActivityThread.currentApplication()` 这时还是 null，
-        // 之前同步调用直接静默 return —— 日志里连一行都看不到，补丁永远不生效）。
+        // 启动时把已安装的 Ark 包主动补一遍（延迟 3s + 后台线程：避免在主线程做 ZIP/文件 I/O
+        // 卡顿冷启动后的首屏交互；3s 延迟保证 Application 与真实调色板已就绪）。
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            runCatching { prePatchArkPackages() }
-                .onFailure { Log.w(TAG, "ark pre-patch failed", it) }
+            Thread({
+                runCatching { prePatchArkPackages() }
+                    .onFailure { Log.w(TAG, "ark pre-patch failed", it) }
+            }, "TimMonetArkPatch").apply {
+                isDaemon = true
+                start()
+            }
         }, 3000L)
         hookFileDownloadIcons()
         hookPlusPanelIcons(module, classLoader)
@@ -2028,8 +2032,8 @@ private fun hookDispatchDraw(module: XposedModule) {
                             val dm = vg0.resources.displayMetrics
                             val sw = dm.widthPixels
                             val maxThinH = (2f * dm.density + 0.5f).toInt().coerceAtLeast(1)
-                            val gen = MonetPalette.generation()
-                            val bgPage = TokenMapper.bgPage()
+                            var bgPage = 0
+                            var gen = -1L
                             for (i in 0 until vg0.childCount) {
                                 val ch = vg0.getChildAt(i) ?: continue
                                 if (ch.width != sw || ch.height !in 1..maxThinH) continue
@@ -2037,6 +2041,10 @@ private fun hookDispatchDraw(module: XposedModule) {
                                 // 它们的"亮"是有意为之，压成页面底色等于把高亮抹掉。
                                 if (ch.isClickable || ch.isSelected) continue
                                 val d = ch.background ?: continue
+                                if (gen == -1L) {
+                                    gen = MonetPalette.generation()
+                                    bgPage = TokenMapper.bgPage()
+                                }
                                 val isFastSolid = d is ColorDrawable || d is GradientDrawable
                                 if (!isFastSolid && thinLineCheckedGen[d] == gen) {
                                     val expected = thinLineAppliedFilter[d]
@@ -3167,15 +3175,14 @@ private fun forceBubbleColor(view: View, color: Int) {
 private fun hookForceLightConfig(module: XposedModule) {
     runCatching {
         val m = Resources::class.java.getDeclaredMethod("getConfiguration")
+        val sysRes = Resources.getSystem()
         runCatching { module.deoptimize(m) }
         module.hook(m).intercept { chain ->
             // ⚠️ 绝不能动 Resources.getSystem()：那是**系统全局**配置，而
-            // MonetPalette.systemDark()（"自动"深浅模式）正是靠它判断的 ——
-            // 改了会让"自动"永远落到浅色，等于模块自己的取色被 TIM 的设置绑住
-            // （这正是历史上 isNight 那条链的同类问题）。
-            // 我们只该改 TIM 自己的 Resources。
-            if (chain.thisObject === Resources.getSystem()) return@intercept chain.proceed()
-            val cfg = runCatching { chain.proceed() as? Configuration }.getOrNull()
+            // MonetPalette.systemDark()（"自动"深浅模式）正是靠它判断的。
+            // 直接比较缓存的 sysRes 引用，且去掉热路径上的 runCatching 闭包分配。
+            if (chain.thisObject === sysRes) return@intercept chain.proceed()
+            val cfg = chain.proceed() as? Configuration
             if (cfg != null &&
                 (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
@@ -5629,16 +5636,22 @@ private fun hookSummaryBadge(module: XposedModule) {
                 findMethod(cls, setOf(methodName))
                     ?.let { method ->
                         logOnce("hook installed: quibadge.a.a.$methodName")
-                        module.hook(method).intercept { chain ->
-                            val result = chain.proceed()
-                            if (result is Int) {
-                                if (methodName == "h") {
-                                    MonetPalette.palette().onPrimary
+                        val isOnPrimary = methodName == "h"
+                        if (method.returnType == INT_TYPE) {
+                            // 返回值恒被替换，直接短路免去原方法内部 Resources.getColor 查表开销
+                            module.hook(method).intercept {
+                                val scheme = MonetPalette.palette()
+                                if (isOnPrimary) scheme.onPrimary else scheme.primary
+                            }
+                        } else {
+                            module.hook(method).intercept { chain ->
+                                val result = chain.proceed()
+                                if (result is Int) {
+                                    val scheme = MonetPalette.palette()
+                                    if (isOnPrimary) scheme.onPrimary else scheme.primary
                                 } else {
-                                    MonetPalette.palette().primary
+                                    result
                                 }
-                            } else {
-                                result
                             }
                         }
                     }
@@ -6542,7 +6555,17 @@ private fun hookSummaryBadge(module: XposedModule) {
             // compound drawable。数组只读一次，后面循环复用。
             val drawables = runCatching { tv.compoundDrawables }.getOrNull()
                 ?: return@runCatching
-            if (drawables.all { it == null }) return@runCatching
+            // 仅当存在至少一个非空且尚未设置 colorFilter 的 compound drawable 时，
+            // 才走较重的 isInsideBubble 祖先链检测（否则下面循环会全部 continue）。
+            var hasUnfiltered = false
+            for (i in drawables.indices) {
+                val d = drawables[i]
+                if (d != null && d.colorFilter == null) {
+                    hasUnfiltered = true
+                    break
+                }
+            }
+            if (!hasUnfiltered) return@runCatching
             if (!isInsideBubble(tv)) return@runCatching
             for (d in drawables) {
                 d ?: continue
@@ -8991,40 +9014,10 @@ private fun hookAioEditText(cl: ClassLoader) {
     // ------------------------------------------------------------------
 
     private fun hookBadgeRenderers(module: XposedModule, cl: ClassLoader) {
-        val tintPill: (TextView) -> Unit = { tv ->
-            try {
-                val scheme = MonetPalette.palette()
-                tv.background?.let { bg ->
-                    ColorMath.recolorInPlace(bg, scheme.primary)
-                }
-                tv.setTextColor(scheme.onPrimary)
-                logOnce("chats pill monetized (${tv.text})")
-            } catch (t: Throwable) {
-                Log.w(TAG, "tint chats pill failed", t)
-            }
-        }
-        runCatching {
-            val cls = Class.forName("com.tencent.qqnt.chats.core.adapter.c.a.c", false, cl)
-            val itemCls = Class.forName("com.tencent.qqnt.chats.core.adapter.c.a", false, cl)
-            findMethod(cls, setOf("b"), ViewGroup::class.java, itemCls)
-                ?.let { method ->
-                    logOnce("hook installed: ChatsPill.b")
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        (result as? TextView)?.let(tintPill)
-                        result
-                    }
-                }
-            findMethod(cls, setOf("a"), View::class.java, itemCls)
-                ?.let { method ->
-                    logOnce("hook installed: ChatsPill.a")
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        (chain.getArg(0) as? TextView)?.let(tintPill)
-                        result
-                    }
-                }
-        }
+        // ⚠️ c.a.c.b 与 c.a.c.a 已由 hookSwipeMenuButtonRenderer 挂载带 colorFilter 守卫的
+        // tintSwipeMenuButton，这里不再重复挂第二层无条件重染 hook（simpleperf 实测该重复
+        // hook 每次行绑定都触发 SkinnableBitmapDrawable 位图重渲染 + setTextColor 重排，
+        // 占主线程 7.3% CPU）。这里只保留 LayoutPreLoader 的 d.b.d。
         runCatching {
             val cls = Class.forName("com.tencent.qqnt.chats.core.adapter.d.b", false, cl)
             findMethod(
@@ -9035,7 +9028,7 @@ private fun hookAioEditText(cl: ClassLoader) {
                 logOnce("hook installed: ChatsPill.d")
                 module.hook(method).intercept { chain ->
                     val result = chain.proceed()
-                    (result as? TextView)?.let(tintPill)
+                    (result as? TextView)?.let { tintSwipeMenuButton(it) }
                     result
                 }
             }
@@ -9510,9 +9503,8 @@ private fun hookAioEditText(cl: ClassLoader) {
                     // 红色"群待办/待办"文字标签 → primary（AIO 群待办通知条等）
                     val redOpaque = opaqueColor(color)
                     if (isErrorRed(redOpaque)) {
-                        val view = chain.thisObject as? TextView
-                        val t = view?.text?.toString().orEmpty()
-                        if (t.contains("待办") || t.contains("[群")) {
+                        val t = tvObj?.text
+                        if (t != null && (t.contains("待办") || t.contains("[群"))) {
                             val scheme = MonetPalette.palette()
                             return@intercept chain.proceed(arrayOf<Any>(scheme.primary))
                         }
@@ -9862,8 +9854,24 @@ private fun hookAioEditText(cl: ClassLoader) {
 
     private var bitmapBgLog = 0
 
+    /** 资源层 tintDrawable 实例代次缓存：getDrawable(int) → getDrawable(int, Theme) →
+     *  loadDrawable(…) 与 SkinEngine.loadDrawable 会对同一个 drawable 连续触发 2~3 次
+     *  tintDrawable，命中缓存直接 O(1) 放行，避免重复染色与位图重渲染。 */
+    private val drawableResTintMemo: MutableMap<Any, Long> = ColorMath.instanceCache()
+
     private fun tintDrawable(name: String?, drawable: Drawable): Drawable {
         if (name == null) return drawable
+        val gen = MonetPalette.generation()
+        if (drawableResTintMemo[drawable] == gen) {
+            return drawable
+        }
+        val out = tintDrawableImpl(name, drawable)
+        drawableResTintMemo[out] = gen
+        if (out !== drawable) drawableResTintMemo[drawable] = gen
+        return out
+    }
+
+    private fun tintDrawableImpl(name: String, drawable: Drawable): Drawable {
         // 图标白底:登记后保持原样(通用兜底会按"白色→深色"把它改掉)
         if (isIconPlateName(name)) {
             iconPlateMemo.add(drawable)
@@ -10359,6 +10367,10 @@ private fun hookAioEditText(cl: ClassLoader) {
         override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
     }
 
+    /** 按资源名缓存"是否单色图标"的判定结果：Resources.getDrawable 每次返回新实例，
+     *  仅靠实例弱引用缓存会每次 miss 并重复 rasterizeIconUniform 整图扫描。 */
+    private val monochromeResNameMemo = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     /** 兜底染色:图标整体染 onSurface(单色图形 SRC_IN 安全)。
      *  仅深色配色下生效,并同时覆盖 tint(压掉 XML android:tint)。 */
     private fun tintIconOnSurface(drawable: Drawable, name: String): Drawable {
@@ -10368,12 +10380,20 @@ private fun hookAioEditText(cl: ClassLoader) {
             // ⚠️ 宽匹配（`qui_` 前缀 / 含 `_ic`）命中的资源里混着背景/装饰/插画，
             // 无差别 SRC_IN 会把**彩色图形压成一块纯色**（审计 #8）。
             // 规则：显式含 "icon" 命名的照旧（那是明确的图标语义），
-            // 其余宽匹配必须通过"单色图形"门槛（彩色像素占比 >40% 即跳过）。
-            if (!name.lowercase().contains("icon") && !isMonochromeIcon(drawable)) {
-                return drawable
+            // 其余宽匹配必须通过"单色图形"门槛（彩色像素占比 >40% 即跳过），并按资源名缓存。
+            if (!name.contains("icon", ignoreCase = true)) {
+                val cached = monochromeResNameMemo[name]
+                val mono = if (cached != null) {
+                    cached
+                } else {
+                    val v = isMonochromeIcon(drawable)
+                    monochromeResNameMemo[name] = v
+                    v
+                }
+                if (!mono) return drawable
             }
             val c = scheme.onSurface
-            if (iconNameLog++ < 200) {
+            if (iconNameLog++ < 40) {
                 Log.i(
                     TAG,
                     "icon res tinted name=$name d=" + drawable.javaClass.simpleName +
@@ -11250,6 +11270,11 @@ private fun hookAioEditText(cl: ClassLoader) {
         }
     }
 
+    /** 已重映射的 ColorStateList 实例代次缓存：getColorStateList(int) →
+     *  getColorStateList(int, Theme) → loadColorStateList 会对同一 CSL 连续触发 2~3 次，
+     *  已处理过的实例直接 O(1) 返回，免去反射读字段与 Arrays.hashCode。 */
+    private val remappedCslGen: MutableMap<Any, Long> = ColorMath.instanceCache()
+
     /** 从 ColorStateList 中取出 states/colors，重映射后重建（不污染原对象）。 */
     @Suppress("UNCHECKED_CAST")
     private fun remapColorStateList(
@@ -11257,6 +11282,9 @@ private fun hookAioEditText(cl: ClassLoader) {
         csl: ColorStateList,
         name: String?
     ): ColorStateList? {
+        val generation = MonetPalette.generation()
+        if (remappedCslGen[csl] == generation) return csl
+
         val specs = try {
             val field = cachedField(csl.javaClass, "mStateSpecs") ?: return null
             field.isAccessible = true
@@ -11277,7 +11305,6 @@ private fun hookAioEditText(cl: ClassLoader) {
         // （历史上还有一段 `dark` 标志位 —— 那个参数不参与取色，只是让缓存多存一份。）
         val cacheKey = (resId.toLong() shl 33) xor
             ((Arrays.hashCode(colors).toLong() and 0xFFFFFFFFL) shl 1)
-        val generation = MonetPalette.generation()
         cslCache[cacheKey]?.let { cached ->
             if (cached.generation == generation) return cached.csl
         }
@@ -11286,6 +11313,7 @@ private fun hookAioEditText(cl: ClassLoader) {
             TokenMapper.mapColor(name, colors[index])
         }
         val out = newSkinCsl(specs, mapped)
+        remappedCslGen[out] = generation
         cslCache[cacheKey] = CachedCsl(generation, out)
         if (cslCache.size > 16384) cslCache.clear()
         return out
