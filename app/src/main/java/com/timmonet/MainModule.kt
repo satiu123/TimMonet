@@ -18,15 +18,19 @@ class MainModule : XposedModule() {
         const val TARGET_PACKAGE = "com.tencent.tim"
     }
 
+    @Volatile
+    private var currentProcessName: String = ""
+
     override fun onModuleLoaded(param: XposedModuleInterface.ModuleLoadedParam) {
+        currentProcessName = param.processName
         Log.i(TAG, "onModuleLoaded, process=${param.processName}, isSystemServer=${param.isSystemServer}")
     }
 
     override fun onPackageReady(param: XposedModuleInterface.PackageReadyParam) {
         if (param.packageName != TARGET_PACKAGE) return
-        Log.i(TAG, "onPackageReady ${param.packageName}, first=${param.isFirstPackage}")
+        Log.i(TAG, "onPackageReady ${param.packageName}, process=$currentProcessName, first=${param.isFirstPackage}")
         try {
-            TimMonetHooks.install(this, param.classLoader)
+            TimMonetHooks.install(this, param.classLoader, currentProcessName)
         } catch (t: Throwable) {
             Log.e(TAG, "install hooks failed", t)
         }

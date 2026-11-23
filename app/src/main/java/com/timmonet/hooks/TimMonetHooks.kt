@@ -306,7 +306,7 @@ object TimMonetHooks {
     }
 
     /** 全部功能钩子的统一入口（MainModule 调用）。 */
-    fun install(module: XposedModule, classLoader: ClassLoader) {
+    fun install(module: XposedModule, classLoader: ClassLoader, processName: String = "") {
         timClassLoader = classLoader
         SettingsBridge.attach(module)
         hookQuiTokenManager(module, classLoader)
@@ -365,7 +365,15 @@ object TimMonetHooks {
         hookStatusBar(module)
         hookAioEditText(classLoader)
         hookAvTintDrawable(module, classLoader)
-        hookPayPwdGridSetColor(module)
+        // Paint.setColor 是每帧调用数千次的高频热方法（主进程实测占 1.76% UI CPU）；
+        // 支付密码弹窗仅运行在 :tool / qwallet 独立进程（坑 12），且 hookPayPwdPaints
+        // 已按类身份覆盖 init()，主进程无需挂 Paint.setColor 兜底。
+        if (processName.isEmpty() ||
+            processName.endsWith(":tool") ||
+            processName.contains("qwallet", ignoreCase = true)
+        ) {
+            hookPayPwdGridSetColor(module)
+        }
         hookPayPwdPaints(module, classLoader)
         hookAioBubbleText(module, classLoader)
         hookAioBubbleBg(module, classLoader)
@@ -1931,10 +1939,10 @@ private fun looksLikeAccountCharSeq(cs: CharSequence?): Boolean {
 /** 长数字文本(QQ 号等)在 attach 时兜底:布局里静态写的文本不经过
  *  setText,只在挂载时补齐染色(不透明 onSurface)。 */
 private fun hookLongNumberText() {
-    onViewAttachedIf({ v -> v is TextView && (v.text?.length ?: 0) in 5..32 }) { v ->
-        val tv = v as TextView   // 闸门已保证类型，这里只是给编译器看
+    onTextViewAttached { tv ->
+        if ((tv.text?.length ?: 0) !in 5..32) return@onTextViewAttached
         // 第三方模块注入界面:整体跳过染色
-        if (isThirdPartyUiActive()) return@onViewAttachedIf
+        if (isThirdPartyUiActive()) return@onTextViewAttached
         if (looksLikeAccountCharSeq(tv.text) && !isInProfileCardUi(tv)) {
             runCatching {
                 val scheme = MonetPalette.palette()
@@ -2007,6 +2015,9 @@ private val thinLineCheckedGen: MutableMap<Any, Long> = ColorMath.instanceCache(
 private val thinLineAppliedFilter: MutableMap<Any, android.graphics.ColorFilter> =
     ColorMath.instanceCache()
 
+@Volatile private var cachedScreenWidth = 0
+@Volatile private var cachedThinMaxH = 0
+
 /**
  * `ViewGroup.dispatchDraw` 的单一入口，承载两件事：
  * 1. **面板图标**（原有职责，见下方 `panelSeen` 分支）；
@@ -2025,20 +2036,24 @@ private fun hookDispatchDraw(module: XposedModule) {
                 try {
                     val vg0 = chain.thisObject as? ViewGroup
                     // 极细（≤2dp）且全宽的**分隔线**兜底（仅深色模式需要）。
-                    // 廉价预筛 + 非纯色 drawable 按实例/代次/滤镜状态缓存，避免每帧
-                    // 对同一条细线重复 renderSample 分配 Bitmap。
+                    // 先卡 vg0.width >= sw（非全宽容器不可能包含全宽子 View，跳过 ~80% ViewGroup），
+                    // 缓存屏幕宽度与 2dp 像素值避免每帧读 displayMetrics。
                     if (vg0 != null && vg0.childCount > 0 && MonetPalette.isDarkNow()) {
-                        runCatching {
+                        var sw = cachedScreenWidth
+                        var maxThinH = cachedThinMaxH
+                        if (sw <= 0) {
                             val dm = vg0.resources.displayMetrics
-                            val sw = dm.widthPixels
-                            val maxThinH = (2f * dm.density + 0.5f).toInt().coerceAtLeast(1)
+                            sw = dm.widthPixels
+                            maxThinH = (2f * dm.density + 0.5f).toInt().coerceAtLeast(1)
+                            cachedScreenWidth = sw
+                            cachedThinMaxH = maxThinH
+                        }
+                        if (vg0.width >= sw) {
                             var bgPage = 0
                             var gen = -1L
                             for (i in 0 until vg0.childCount) {
                                 val ch = vg0.getChildAt(i) ?: continue
                                 if (ch.width != sw || ch.height !in 1..maxThinH) continue
-                                // 有交互语义的细线（选中下划线、进度/滑块填充）不碰：
-                                // 它们的"亮"是有意为之，压成页面底色等于把高亮抹掉。
                                 if (ch.isClickable || ch.isSelected) continue
                                 val d = ch.background ?: continue
                                 if (gen == -1L) {
@@ -2067,11 +2082,12 @@ private fun hookDispatchDraw(module: XposedModule) {
                                 }
                                 ColorMath.recolorInPlace(d, bgPage)
                                 if (!isFastSolid) {
+                                    // 注意：SkinnableBitmapDrawable 不重写 getColorFilter()，
+                                    // 改色后 d.colorFilter 仍可能为 null；这里必须照常登记代次缓存。
                                     val f = d.colorFilter
-                                    if (f != null) {
-                                        thinLineAppliedFilter[d] = f
-                                        thinLineCheckedGen[d] = gen
-                                    }
+                                    if (f != null) thinLineAppliedFilter[d] = f
+                                    else thinLineAppliedFilter.remove(d)
+                                    thinLineCheckedGen[d] = gen
                                 }
                                 if (thinLineLog++ < 12) {
                                     Log.i(
@@ -2300,14 +2316,22 @@ private fun hookSwipeMenuButtonRenderer(module: XposedModule, cl: ClassLoader) {
     }.onFailure { Log.w(TAG, "hook chats swipe button renderer failed", it) }
 }
 
-/** 把左滑菜单按钮染成 primary 底 + onPrimary 字；已经染过（背景带 filter）就跳过。 */
+/** 左滑菜单按钮背景已染色代次缓存：SkinnableBitmapDrawable 不重写 getColorFilter()，
+ *  仅判 bg.colorFilter == null 会恒为 true 导致每次行绑定都触发位图重渲染（实测 2.25% CPU）。 */
+private val swipeMenuBgTintedGen: MutableMap<Any, Long> = ColorMath.instanceCache()
+
+/** 把左滑菜单按钮染成 primary 底 + onPrimary 字；同一代次已染过就跳过。 */
 private fun tintSwipeMenuButton(tv: TextView) {
     val scheme = MonetPalette.palette()
     val bg = tv.background
-    if (bg != null && bg.colorFilter == null) {
-        bg.mutate()
-        bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
-        bg.setTint(scheme.primary)
+    if (bg != null) {
+        val gen = MonetPalette.generation()
+        if (swipeMenuBgTintedGen[bg] != gen) {
+            bg.mutate()
+            bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
+            bg.setTint(scheme.primary)
+            swipeMenuBgTintedGen[bg] = gen
+        }
     }
     if (opaqueColor(tv.currentTextColor) != opaqueColor(scheme.onPrimary)) {
         tv.setTextColor(scheme.onPrimary)
@@ -5637,7 +5661,9 @@ private fun hookSummaryBadge(module: XposedModule) {
                     ?.let { method ->
                         logOnce("hook installed: quibadge.a.a.$methodName")
                         val isOnPrimary = methodName == "h"
-                        if (method.returnType == INT_TYPE) {
+                        if (method.returnType == INT_TYPE ||
+                            method.returnType == Integer::class.javaObjectType
+                        ) {
                             // 返回值恒被替换，直接短路免去原方法内部 Resources.getColor 查表开销
                             module.hook(method).intercept {
                                 val scheme = MonetPalette.palette()
@@ -6022,8 +6048,7 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun hookTextContrast() {
         // 注意挂 View.onAttachedToWindow：TextView 自己没重写这个方法，
         // findMethod(TextView::class.java, ...) 会返回 null、hook 根本装不上。
-        onViewAttachedIf({ it is TextView }) { v ->
-            val tv = v as TextView
+        onTextViewAttached { tv ->
             if (!isThirdPartyUiActive()) {
                 val needRecheck = runCatching { fixLowContrastText(tv) }.getOrDefault(false)
                 // 只有文字本身确实是深灰、且此刻尚未读到深底时，才 post 下一帧再判一次；
@@ -6168,6 +6193,8 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** 系统配置变化回调：只在"日夜位真的变了"且模块处于自动模式时强停 TIM。 */
     private fun onSystemConfigChanged(cfg: Configuration) {
         MonetPalette.invalidateSystemDarkCache()
+        cachedScreenWidth = 0
+        cachedThinMaxH = 0
         val night = cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK
         val prev = systemNightLast
         systemNightLast = night
@@ -6383,8 +6410,8 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun hookNearBlackHint(module: XposedModule) {
         // hint 常在 attach 之后才设：setHintTextColor 已挂 hook（设置入口），
         // 原来这里再 post 一次属于重复工作（每个 attach 的 TextView 一个 Runnable）。
-        onViewAttachedIf({ it is TextView }) { v ->
-            fixNearBlackHint(v as TextView)
+        onTextViewAttached { tv ->
+            fixNearBlackHint(tv)
         }
         // 合并 AIOEditText 的 hint 覆写到此，避免同一框架方法叠两层 hook。
         findMethod(TextView::class.java, setOf("setHintTextColor"), INT_TYPE)
@@ -6486,8 +6513,8 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private fun hookSearchBarIcon() {
         // setImageDrawable / setImageResource 已合并到 hookImageViewRedDot 的单一 hook 中
-        onViewAttachedIf({ it is ImageView && insideSearchBar(it) }) { v ->
-            fixSearchBarIcon(v as ImageView)
+        onImageViewAttached { iv ->
+            if (insideSearchBar(iv)) fixSearchBarIcon(iv)
         }
     }
 
@@ -6592,49 +6619,28 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private fun hookBubbleCompoundIcon(module: XposedModule) {
-        onViewAttachedIf({ it is TextView }) { v ->
-            val tv = v as TextView
-            // ⚠️ 这里曾经还有一次 `v.post { fixBubbleCompoundIcon(tv) }`（早期用来
-            // 兜"TIM 随后重设 drawable"）。现在 setCompoundDrawables* 的六个重载
-            // 全都挂了 hook，重设由"设置入口"覆盖（身份判据、与时机无关），
-            // 那次 post 等于把每个 attach 的工作量翻倍 + 往 UI 队列里塞一个
-            // Runnable —— 实测这条 attach 路径占主线程 13.4%，故删除。
+        onTextViewAttached { tv ->
             fixBubbleCompoundIcon(tv)
         }
-        // ⚠️ 关键：TIM 会在我们染色之后**重新设置** compound drawable（重绑/复用），
-        // 一次性染色会被覆盖 —— 实测"进页面时都染对了，几秒后部分图标回到 onSurface"。
-        // 所以挂在**设置入口**上，每次设置完立刻重新对齐，与时机无关（不猜延时）。
-        val hooks: List<Pair<String, Array<Class<*>>>> = listOf(
-            "setCompoundDrawables" to arrayOf(
-                Drawable::class.java, Drawable::class.java,
-                Drawable::class.java, Drawable::class.java
-            ),
-            "setCompoundDrawablesWithIntrinsicBounds" to arrayOf(
-                Drawable::class.java, Drawable::class.java,
-                Drawable::class.java, Drawable::class.java
-            ),
-            "setCompoundDrawablesRelative" to arrayOf(
-                Drawable::class.java, Drawable::class.java,
-                Drawable::class.java, Drawable::class.java
-            ),
-            "setCompoundDrawablesRelativeWithIntrinsicBounds" to arrayOf(
-                Drawable::class.java, Drawable::class.java,
-                Drawable::class.java, Drawable::class.java
-            ),
-            "setCompoundDrawablesWithIntrinsicBounds" to arrayOf(
-                INT_TYPE, INT_TYPE, INT_TYPE, INT_TYPE
-            ),
-            "setCompoundDrawablesRelativeWithIntrinsicBounds" to arrayOf(
-                INT_TYPE, INT_TYPE, INT_TYPE, INT_TYPE
-            )
+        // ⚠️ AOSP TextView 里 4 个 WithIntrinsicBounds 重载最终都转发给以下两个基础方法，
+        // 只挂这 2 个即可覆盖全部 6 个重载（免去每次 setCompoundDrawables 重复跑 2~3 遍），
+        // 且 4 个入参全为 null 时直接 O(1) 跳过，免去分配 tv.compoundDrawables 数组。
+        val baseHooks = listOf("setCompoundDrawables", "setCompoundDrawablesRelative")
+        val params = arrayOf<Class<*>>(
+            Drawable::class.java, Drawable::class.java,
+            Drawable::class.java, Drawable::class.java
         )
-        for ((name, params) in hooks) {
+        for (name in baseHooks) {
             findMethod(TextView::class.java, setOf(name), *params)?.let { m ->
                 runCatching { module.deoptimize(m) }
                 module.hook(m).intercept { chain ->
                     val r = chain.proceed()
-                    runCatching {
-                        (chain.thisObject as? TextView)?.let { fixBubbleCompoundIcon(it) }
+                    if (chain.getArg(0) != null || chain.getArg(1) != null ||
+                        chain.getArg(2) != null || chain.getArg(3) != null
+                    ) {
+                        runCatching {
+                            (chain.thisObject as? TextView)?.let { fixBubbleCompoundIcon(it) }
+                        }
                     }
                     r
                 }
@@ -6818,22 +6824,26 @@ private fun hookSummaryBadge(module: XposedModule) {
     private val gatedAttachHandlers =
         java.util.concurrent.CopyOnWriteArrayList<Pair<(View) -> Boolean, (View) -> Unit>>()
 
+    /** 按控件大类分桶的 attach 处理器：非 TextView/ImageView 容器（占列表 View 约 60%）
+     *  一次 instanceof 即可跳过全部文本/图片处理器，不再逐个调用 gate lambda。 */
+    private val textViewAttachHandlers =
+        java.util.concurrent.CopyOnWriteArrayList<(TextView) -> Unit>()
+
+    private val imageViewAttachHandlers =
+        java.util.concurrent.CopyOnWriteArrayList<(ImageView) -> Unit>()
+
     private fun onViewAttached(handler: (View) -> Unit) {
         attachHandlers.add(handler)
     }
 
-    /**
-     * 带**廉价身份闸门**的 attach 处理器。
-     *
-     * 为什么需要：`onAttachedToWindow` 的分发器对每个 attach 的 View 跑**全部**
-     * 处理器（实测 21 个 × 每个 attach 的 View；聊天列表滚动 10 秒里 3266 个 View
-     * ⇒ 68,586 次处理器调用、**吃掉主线程 1.72 秒**，占该窗口主线程时间的 17%）。
-     * 绝大多数处理器只关心某一类 View（TextView/ImageView/某个 TIM 类），
-     * 把"类型判断"从这个调用里提到闸门里，不匹配的 View 连处理器都不进。
-     *
-     * ⚠️ [gate] 必须是**纯身份判断**（类名/类型/id 高位），它每个 attach 的 View 都会跑：
-     * 不要在这里查颜色、几何、做 IO；也不要让它抛异常（不走 runCatching）。
-     */
+    private fun onTextViewAttached(handler: (TextView) -> Unit) {
+        textViewAttachHandlers.add(handler)
+    }
+
+    private fun onImageViewAttached(handler: (ImageView) -> Unit) {
+        imageViewAttachHandlers.add(handler)
+    }
+
     private fun onViewAttachedIf(gate: (View) -> Boolean, handler: (View) -> Unit) {
         gatedAttachHandlers.add(gate to handler)
     }
@@ -6845,19 +6855,29 @@ private fun hookSummaryBadge(module: XposedModule) {
                 runCatching { module.deoptimize(method) }
                 module.hook(method).intercept { chain ->
                     val result = chain.proceed()
+                    val v = chain.thisObject as? View ?: return@intercept result
                     val n = attachHandlers.size
-                    val gated = gatedAttachHandlers
-                    if (n > 0 || gated.isNotEmpty()) {
-                        val v = chain.thisObject as? View
-                        if (v != null) {
-                            for (i in 0 until n) {
-                                runCatching { attachHandlers[i](v) }
-                            }
-                            for (i in gated.indices) {
-                                val entry = gated[i]
-                                if (entry.first(v)) runCatching { entry.second(v) }
+                    for (i in 0 until n) {
+                        runCatching { attachHandlers[i](v) }
+                    }
+                    when (v) {
+                        is TextView -> {
+                            val tn = textViewAttachHandlers.size
+                            for (i in 0 until tn) {
+                                runCatching { textViewAttachHandlers[i](v) }
                             }
                         }
+                        is ImageView -> {
+                            val in2 = imageViewAttachHandlers.size
+                            for (i in 0 until in2) {
+                                runCatching { imageViewAttachHandlers[i](v) }
+                            }
+                        }
+                    }
+                    val gated = gatedAttachHandlers
+                    for (i in gated.indices) {
+                        val entry = gated[i]
+                        if (entry.first(v)) runCatching { entry.second(v) }
                     }
                     result
                 }
@@ -6930,8 +6950,8 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  排除了 PolarLight 也无效，因为覆盖发生在后面）。
      *  这里在 attach 之后再补染一次，让专用结果成为最终结果。 */
     private fun hookPolarLightLate() {
-        onViewAttachedIf({ it is android.widget.ImageView && hasClassFlag(it.javaClass, CF_POLAR_LIGHT) }) { v0 ->
-            val v = v0 as android.widget.ImageView
+        onImageViewAttached { v ->
+            if (!hasClassFlag(v.javaClass, CF_POLAR_LIGHT)) return@onImageViewAttached
             v.postDelayed({
                 runCatching {
                     if (!MonetPalette.isDarkNow()) return@runCatching
@@ -7181,10 +7201,9 @@ private fun hookSummaryBadge(module: XposedModule) {
         ColorMath.recolorInPlace(d, targetBg)
         if (isCacheable) {
             val f = d.colorFilter
-            if (f != null) {
-                tinySolidBgFilter[d] = f
-                tinySolidBgCheckedGen[d] = gen
-            }
+            if (f != null) tinySolidBgFilter[d] = f
+            else tinySolidBgFilter.remove(d)
+            tinySolidBgCheckedGen[d] = gen
         }
         // ⚠️ 注意：这里以前**漏了实际应用**（只构造了 gd 却没 setBackground），
         // 于是整条"亮底压暗"规则是空操作、却照打"已改成页面底色"的日志 ——
